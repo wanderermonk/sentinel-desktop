@@ -35,6 +35,7 @@ DEFAULT_POLICY = {
     "fw_blocked_ips": [],           # IPs Sentinel blocked in the firewall
     "applied_fixes": {},            # finding id -> time a fix succeeded (cleared once the check passes)
     "trusted_apps": [],             # process names never flagged by anomaly detection
+    "egress": {},                   # Egress Watch overrides (see sentinel/egress/monitor.py DEFAULTS)
     "ollama_model": "llama3.2",
     "ollama_url": "http://127.0.0.1:11434",
 }

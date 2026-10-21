@@ -17,6 +17,7 @@ pyinstaller backend/server.py \
   --distpath backend-dist --workpath build-py --specpath build-py \
   --paths backend \
   --add-data "$(pwd)/backend/sentinel/knowledge:sentinel/knowledge" \
-  --hidden-import sentinel.advisor --hidden-import sentinel.network --hidden-import sentinel.vulns
+  --hidden-import sentinel.advisor --hidden-import sentinel.network --hidden-import sentinel.vulns \
+  --hidden-import sentinel.egress --hidden-import sentinel.egress.monitor --hidden-import sentinel.egress.collectors
 
 echo "Built: backend-dist/sentinel-backend"

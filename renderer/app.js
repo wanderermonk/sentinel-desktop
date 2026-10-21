@@ -19,14 +19,14 @@ async function api(path, opts = {}) {
 
 const S = { view: 'dashboard', summary: null, ports: null, conns: null, audit: null, alertsSince: Date.now() / 1000 - 5,
             portFilter: 'exposed', portSearch: '', netFilter: 'flagged', netSearch: '', expanded: new Set(), fixOpen: new Set(),
-            chat: [], ai: null, scanning: false };
+            chat: [], ai: null, scanning: false, egress: null };
 
 // ------------------------------------------------------------------ helpers
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const SEV = { critical: 'var(--critical)', high: 'var(--high)', medium: 'var(--medium)', low: 'var(--low)' };
 const VERDICT = { malicious: ['var(--critical)', 'Malicious'], unauthorised: ['var(--high)', 'Unauthorised'],
-                  suspicious: ['var(--medium)', 'Suspicious'], new: ['var(--violet)', 'New destination'], blocked: ['var(--muted)', 'Blocked'], ok: ['var(--good)', 'Normal'] };
+                  suspicious: ['var(--medium)', 'Suspicious'], new: ['var(--violet)', 'New destination'], exfil: ['var(--high)', 'Data leaving'], blocked: ['var(--muted)', 'Blocked'], ok: ['var(--good)', 'Normal'] };
 const ago = ts => { if (!ts) return 'never'; const s = Math.round(Date.now() / 1000 - ts); return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : new Date(ts * 1000).toLocaleString(); };
 const sevChip = s => `<span class="chip sev" style="color:${SEV[s]};border-color:${SEV[s]}55"><i style="background:${SEV[s]}"></i>${esc(s)}</span>`;
 const verdictChip = v => `<span class="chip" style="color:${VERDICT[v][0]};border-color:${VERDICT[v][0]}55"><i style="background:${VERDICT[v][0]}"></i>${VERDICT[v][1]}</span>`;
@@ -130,7 +130,7 @@ function setBusy(btn, busy, label) {
 }
 
 // ------------------------------------------------------------------ navigation
-const TITLES = { dashboard: 'Runtime Security', ports: 'Open Ports', network: 'Network Monitor', vulns: 'Vulnerabilities & Patches', advisor: 'AI Security Advisor', settings: 'Settings & Threat Intel' };
+const TITLES = { dashboard: 'Runtime Security', ports: 'Open Ports', network: 'Network Monitor', egress: 'Data Leaving This Mac', vulns: 'Vulnerabilities & Patches', advisor: 'AI Security Advisor', settings: 'Settings & Threat Intel' };
 function go(view) {
   S.view = view;
   document.querySelectorAll('.rail button[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === view));
@@ -141,7 +141,7 @@ function go(view) {
 document.querySelectorAll('.rail button[data-view]').forEach(b => b.onclick = () => go(b.dataset.view));
 
 function render() {
-  ({ dashboard: renderDashboard, ports: renderPorts, network: renderNetwork, vulns: renderVulns, advisor: renderAdvisor, settings: renderSettings })[S.view]();
+  ({ dashboard: renderDashboard, ports: renderPorts, network: renderNetwork, egress: renderEgress, vulns: renderVulns, advisor: renderAdvisor, settings: renderSettings })[S.view]();
 }
 
 // ------------------------------------------------------------------ scanning
@@ -480,6 +480,65 @@ async function blockConnFlow(c) {
   if (out.ok) await refreshAll();
 }
 
+// ------------------------------------------------------------------ egress watch (data leaving the machine)
+const fmtB = n => { n = n || 0; const u = ['B', 'KB', 'MB', 'GB']; let i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return `${i ? n.toFixed(1) : n} ${u[i]}`; };
+const sigChip = s => !s ? '<span class="muted">-</span>' : s === 'apple' ? '<span class="chip">Apple</span>'
+  : s.startsWith('developer:') ? `<span class="chip" data-tip="${esc(s.slice(10))}">Signed</span>`
+  : `<span class="chip" style="color:var(--high);border-color:var(--high)55">${esc(s)}</span>`;
+
+function sparkline(tl) {
+  if (!tl || tl.length < 2) return '<div class="empty">Collecting data - the 24-hour upload timeline appears after a few minutes.</div>';
+  const W = 900, H = 90, max = Math.max(1, ...tl.map(t => t.out));
+  const x = i => i / (tl.length - 1) * W, y = v => H - 4 - v / max * (H - 10);
+  const pts = tl.map((t, i) => `${x(i).toFixed(1)},${y(t.out).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="width:100%;height:${H}px" role="img" aria-label="Upload over 24 hours">
+    <polyline points="0,${H} ${pts} ${W},${H}" fill="var(--high)" fill-opacity=".12" stroke="none"/>
+    <polyline points="${pts}" fill="none" stroke="var(--high)" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>
+    <div class="muted" style="display:flex;justify-content:space-between;font-size:11px"><span>${new Date(tl[0].ts * 1000).toLocaleTimeString()}</span><span>peak ${fmtB(max)} / 5 min</span><span>now</span></div>`;
+}
+
+async function renderEgress() {
+  const el = $('#view-egress');
+  try { S.egress = await api('/api/egress'); } catch (e) { el.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  const e = S.egress, apps = e.apps || [], alerts = e.alerts || [];
+  const up5 = apps.reduce((a, x) => a + x.out_5m, 0), up24 = apps.reduce((a, x) => a + x.out_24h, 0);
+  el.innerHTML = `<div class="page">
+    ${!e.collector.available ? `<div class="banner" style="margin-bottom:12px">${esc(e.collector.note || 'Per-app traffic accounting is not available on this OS yet.')}</div>` : ''}
+    ${e.collector.note && e.collector.available ? `<div class="banner" style="margin-bottom:12px">${esc(e.collector.note)}</div>` : ''}
+    ${e.learning ? `<div class="banner" style="margin-bottom:12px;background:#121a2a;border-color:#1f3558;color:#a9c8f5">Learning how much each app normally uploads until ${new Date(e.learning_until * 1000).toLocaleString()}. Big spikes from known apps are still flagged.</div>` : ''}
+    <div class="kpis">
+      <div class="kpi"><div class="l">Uploaded · last 5 min</div><div class="v num">${fmtB(up5)}</div></div>
+      <div class="kpi"><div class="l">Uploaded · 24 h</div><div class="v num">${fmtB(up24)}</div></div>
+      <div class="kpi"><div class="l">Apps sending data</div><div class="v num">${apps.filter(a => a.out_24h || a.out_5m).length}</div></div>
+      <div class="kpi"><div class="l">Exfil alerts</div><div class="v num" style="color:${alerts.length ? 'var(--high)' : 'var(--text)'}">${alerts.length}</div></div>
+    </div>
+    <div class="panel" style="margin:12px 0"><div class="muted" style="margin-bottom:6px">Upload volume, last 24 h (all apps)</div>${sparkline(e.timeline)}</div>
+    ${alerts.length ? `<h3 style="margin:16px 0 8px">Alerts</h3><div class="alerts">${alerts.map((a, i) => `<div class="alert" style="border-left-color:${SEV[a.severity]}">
+      ${sevChip(a.severity)}<div style="flex:1"><div class="a-t">${esc(a.title)}</div><div class="a-d">${esc(a.detail)}</div>
+      ${(a.destinations || []).length ? `<div class="a-d" style="margin-top:4px">Talking to: ${a.destinations.map((d, j) => `<span class="mono">${esc(d.ip)}:${d.port}</span> <button class="btn sm danger" data-eblock="${i}:${j}">Block</button>`).join(' ')}</div>` : ''}
+      <div style="margin-top:6px;display:flex;gap:6px">${(a.pids || []).length ? `<button class="btn sm" data-ekill="${i}">Terminate ${esc(a.app)}</button>` : ''}<button class="btn sm ghost" data-etrust="${i}" data-tip="Trusted apps need ${e.settings?.trusted_factor || 4}x more traffic to alert">Trust app</button></div></div>
+      <span class="muted" style="font-size:11px">${ago(a.ts)}</span></div>`).join('')}</div>` : ''}
+    <h3 style="margin:16px 0 8px">Top uploaders</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Application</th><th>Last 5 min ↑</th><th>Last hour ↑</th><th>24 h ↑</th><th>24 h ↓</th><th>Usual peak / 5 min</th><th>Signature</th></tr></thead>
+      <tbody>${apps.map(a => `<tr>
+        <td class="strong">${esc(a.app)}${a.exe ? `<div class="muted mono" style="font-size:11px">${esc(a.exe)}</div>` : ''}</td>
+        <td class="num" style="${a.p95_5m && a.out_5m > 5 * a.p95_5m ? 'color:var(--high)' : ''}">${fmtB(a.out_5m)}</td>
+        <td class="num">${fmtB(a.out_1h)}</td><td class="num">${fmtB(a.out_24h)}</td><td class="num muted">${fmtB(a.in_24h)}</td>
+        <td class="num muted">${a.history_buckets >= 12 ? fmtB(a.p95_5m) : 'learning'}</td><td>${sigChip(a.signature)}</td></tr>`).join('')
+        || '<tr><td colspan="7" class="empty">No outbound traffic recorded yet.</td></tr>'}</tbody>
+    </table></div>
+    <div class="muted" style="font-size:11px;margin-top:8px">Sampling every ${e.interval || 5}s via ${esc(e.collector.name || '-')}. Sentinel sees traffic metadata (who, how much, where), never contents.</div></div>`;
+  el.querySelectorAll('[data-eblock]').forEach(b => b.onclick = () => {
+    const [i, j] = b.dataset.eblock.split(':').map(Number); const a = alerts[i], d = a.destinations[j];
+    blockConnFlow({ app: a.app, pid: d.pid, remote_ip: d.ip, remote_port: d.port, flags: a.reasons });
+  });
+  el.querySelectorAll('[data-ekill]').forEach(b => b.onclick = () => { const a = alerts[+b.dataset.ekill]; killFlow(a.pids[0], a.app); });
+  el.querySelectorAll('[data-etrust]').forEach(b => b.onclick = async () => {
+    const a = alerts[+b.dataset.etrust]; await api('/api/policy/allow', { body: { app: a.app } }); toast(`Trusted ${a.app}`, 'ok');
+  });
+}
+
 // ------------------------------------------------------------------ vulnerabilities
 function renderVulns() {
   const el = $('#view-vulns');
@@ -668,10 +727,12 @@ async function pollAlerts() {
     for (const a of alerts) {
       S.alertsSince = Math.max(S.alertsSince, a.ts);
       if (['malicious', 'unauthorised'].includes(a.verdict) || a.severity === 'high' || a.severity === 'critical') {
-        bridge?.notify(`Sentinel: ${VERDICT[a.verdict][1]} connection`, `${a.title}\n${a.detail}`);
+        bridge?.notify(a.kind === 'egress' ? 'Sentinel: unusual data leaving your Mac' : `Sentinel: ${VERDICT[a.verdict][1]} connection`, `${a.title}\n${a.detail}`, a.kind === 'egress' ? 'egress' : 'network');
+        if (a.kind === 'egress') $('#egDot').hidden = false;
         toast(`⚠ ${VERDICT[a.verdict][1]}: ${a.title}`, 'err');
       }
     }
+    if (S.view === 'egress') renderEgress();
     if (alerts.length || S.view === 'network') {
       S.conns = await api('/api/connections');
       if (S.view === 'network') renderNetwork();
@@ -685,7 +746,9 @@ async function pollAlerts() {
   if (bridge) {
     CFG = await bridge.config();
     bridge.onNavigate(v => go(v));
-    bridge.onBackendDown(() => toast('Scanning engine stopped unexpectedly. Restart Sentinel.', 'err'));
+    bridge.onBackendDown(() => toast('Scanning engine stopped and could not be restarted. Quit and reopen Sentinel.', 'err'));
+    bridge.onBackendRestarted?.(port => { CFG.port = port; toast('Scanning engine restarted - monitoring resumed', 'ok'); refreshAll(); });
+    bridge.onResumed?.(() => { refreshAll(); });
   }
   $('#elevateBtn').onclick = async () => {
     if (!bridge) return;
@@ -695,5 +758,5 @@ async function pollAlerts() {
   };
   render();
   await fullScan();
-  setInterval(pollAlerts, 15000);
+  setInterval(pollAlerts, 10000);
 })();

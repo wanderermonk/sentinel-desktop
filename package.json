@@ -13,7 +13,9 @@
     "build:backend:mac": "bash scripts/build_backend.sh",
     "build:backend:win": "powershell -ExecutionPolicy Bypass -File scripts/build_backend.ps1",
     "dist:mac": "npm run build:backend:mac && electron-builder --mac",
-    "dist:win": "npm run build:backend:win && electron-builder --win"
+    "dist:win": "npm run build:backend:win && electron-builder --win",
+    "install:mac": "bash scripts/install_mac.sh",
+    "uninstall:mac": "bash scripts/uninstall_mac.sh"
   },
   "devDependencies": {
     "electron": "^44.7.0",
@@ -51,7 +53,10 @@
       ],
       "icon": "build/icon.png",
       "darkModeSupport": true,
-      "hardenedRuntime": true
+      "hardenedRuntime": true,
+      "extendInfo": {
+        "LSMultipleInstancesProhibited": true
+      }
     },
     "dmg": {
       "title": "Sentinel ${version}"

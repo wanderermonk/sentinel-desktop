@@ -10,6 +10,24 @@ A standalone, dark-themed desktop app that runs **fully offline** and:
 | **Vulnerabilities & patching** | Audits the OS (support status, firewall, Defender/Gatekeeper, SMBv1, RDP, UAC, BitLocker/FileVault, SIP, Secure Boot, LLMNR, auto-update, guest/auto-login, patch age), and with **Deep scan** lists missing Windows/macOS updates. Matches installed apps against a bundled CVE list (importable). Each finding has a built-in **fix playbook**: why it matters, manual steps, the exact commands, and **Apply fix** where it's safe to automate. |
 | **AI advisor** | Works **without any model**: risk scoring, a prioritised action plan (impact ÷ effort) and a TF-IDF knowledge-base Q&A over the playbooks, port intel, CVEs and your live scan. If [Ollama](https://ollama.com) is running locally, answers are rewritten by your local LLM, grounded on the same facts. Nothing leaves the machine. |
 
+## Egress Watch - data leaving this computer
+
+An always-on upload monitor aimed at data exfiltration (including by AI tools and agents). Every 5 s it samples
+bytes in/out **per process** (macOS: `nettop`, no admin needed), groups helpers under their app bundle, and keeps a
+14-day per-app baseline in 5-minute buckets. It alerts when an app:
+
+* uploads far more than its own usual peak (default: ≥ 10 MB and ≥ 5× its 95th-percentile 5-minute upload),
+* has no upload history and suddenly sends ≥ 5 MB (after a 24 h learning period),
+
+and raises severity when the traffic is upload-heavy, happens at an unusual hour, comes from an unsigned / ad-hoc
+signed binary, or from Temp/Downloads. Each alert shows the live destinations with **Block**, **Terminate** and
+**Trust app** actions. Nothing is blocked automatically. Thresholds can be overridden with the `egress` key in `policy.json`.
+Turn on **Start at login** in the tray menu so it keeps watching in the background.
+
+Other OSes: `backend/sentinel/egress/collectors.py` has a `Collector` interface. Windows (ETW) and Linux (eBPF / nethogs)
+are stubs for now: implement `available()` + `sample()` and the rest of the pipeline works unchanged.
+Tests: `python backend/tests/test_egress.py`.
+
 ## Architecture
 
 ```
@@ -24,6 +42,24 @@ Electron UI (renderer/, vanilla JS, no CDN)  ──HTTP 127.0.0.1 + per-launch t
 ```
 
 Data lives in `%APPDATA%\Sentinel` (Windows) or `~/Library/Application Support/Sentinel` (macOS).
+
+## Install on your Mac (always-on)
+
+```bash
+bash scripts/install_mac.sh        # or: npm run install:mac
+```
+
+Builds the engine and app, installs **/Applications/Sentinel.app**, ad-hoc signs it and launches it. On first launch it
+registers a per-user LaunchAgent (`~/Library/LaunchAgents/com.fighter.sentinel.plist`), so Sentinel:
+
+* **starts hidden in the menu bar at every login** (with automatic login enabled, that means at every boot),
+* **relaunches itself if it crashes** (launchd `KeepAlive`), while *Quit* from the tray still stops it,
+* **re-checks the engine on wake from sleep and screen unlock**, restarting it if needed, and ignores the sleep gap
+  so a wake-up isn't reported as an upload spike (traffic during Power Nap is still recorded),
+* keeps running while hidden (App Nap disabled for Sentinel only; the Mac itself can still sleep).
+
+Toggle it from the tray: **Start automatically at login**. Remove it with `bash scripts/uninstall_mac.sh` (`--purge` also deletes data).
+The `.dmg` in `dist/` installs on other Macs (unsigned: right-click → Open the first time).
 
 ## Run in development
 

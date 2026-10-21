@@ -1,8 +1,9 @@
 // Sentinel - Electron main process.
 // Spawns the bundled Python scanning engine on 127.0.0.1 with a random token,
 // hosts the dark UI, raises native notifications and keeps monitoring from the tray.
-const { app, BrowserWindow, ipcMain, Notification, Tray, Menu, dialog, nativeImage, shell } = require('electron');
-const { spawn, execFile } = require('child_process');
+const { app, BrowserWindow, ipcMain, Notification, Tray, Menu, dialog, nativeImage, shell, powerMonitor, powerSaveBlocker } = require('electron');
+const { spawn, execFile, execFileSync } = require('child_process');
+const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
@@ -73,20 +74,163 @@ async function waitHealthy(port, ms = 20000) {
   return false;
 }
 
+// Engine output goes to <data>/engine.log so a failed start can say *why* it failed.
+function engineLog() { return path.join(dataDir(), 'engine.log'); }
+function logTail(n = 12) {
+  try { return fs.readFileSync(engineLog(), 'utf8').trim().split('\n').slice(-n).join('\n'); } catch (_) { return ''; }
+}
+
 async function startBackend() {
   const { cmd, args } = backendCommand();
+  if (!fs.existsSync(cmd) && path.isAbsolute(cmd)) throw new Error(`Scanning engine is missing: ${cmd}`);
   const port = await freePort();
+  try { fs.renameSync(engineLog(), engineLog() + '.1'); } catch (_) {}
+  const log = fs.openSync(engineLog(), 'a');
+  fs.writeSync(log, `[${new Date().toISOString()}] starting ${cmd} ${args.join(' ')} --port ${port}\n`);
   backend = spawn(cmd, [...args, '--port', String(port), '--token', cfg.token, '--parent-pid', String(process.pid)], {
-    windowsHide: true, env: { ...process.env, PYTHONUNBUFFERED: '1', SENTINEL_DATA: dataDir() },
+    windowsHide: true, stdio: ['ignore', log, log],
+    env: { ...process.env, PYTHONUNBUFFERED: '1', SENTINEL_DATA: dataDir() },
   });
-  backend.stderr.on('data', d => console.error('[backend]', d.toString().trim()));
-  backend.on('exit', code => {
-    console.log('[backend] exited', code);
-    if (!quitting && !cfg.elevated && win) win.webContents.send('backend-down');
+  fs.closeSync(log);
+  const me = backend;
+  let exited = null;
+  backend.on('error', e => { exited = `could not be launched (${e.code || e.message})`; });
+  backend.on('exit', (code, signal) => {
+    exited = signal ? `was killed by ${signal}${signal === 'SIGKILL' && isMac ? ' (macOS usually does this to a binary with an invalid code signature)' : ''}`
+      : `exited with code ${code}`;
+    console.log('[backend]', exited);
+    if (!cfg.port || quitting || cfg.elevated || backend !== me) return;   // still starting, or intentional
+    restartBackend('engine ' + exited);
   });
-  if (!(await waitHealthy(port))) throw new Error('Scanning engine failed to start: ' + cmd);
+  // first launch can be slow: the frozen engine unpacks itself and macOS scans it
+  const until = Date.now() + 90000;
+  let healthy = false;
+  while (!healthy && !exited && Date.now() < until) {
+    healthy = await waitHealthy(port, 1000);
+  }
+  if (!healthy) {
+    try { me.kill(); } catch (_) {}
+    const why = exited ? `The engine ${exited}.` : 'The engine did not respond within 90 seconds.';
+    const tail = logTail();
+    throw new Error(`Scanning engine failed to start.\n${why}\n\n${tail ? 'Last output:\n' + tail + '\n\n' : ''}Full log: ${engineLog()}`);
+  }
   cfg.port = port;
   cfg.elevated = false;
+}
+
+// Bring the engine back after a crash or a failed wake-up, then point the UI at the new port.
+let restarting = false;
+async function restartBackend(reason) {
+  if (restarting || quitting) return;
+  restarting = true;
+  console.log('[backend] restarting:', reason);
+  for (let attempt = 1; attempt <= 5 && !quitting; attempt++) {
+    try {
+      try { backend && backend.kill(); } catch (_) {}
+      backend = null; cfg.port = null;
+      await new Promise(r => setTimeout(r, 1500 * attempt));
+      await startBackend();
+      if (win) win.webContents.send('backend-restarted', cfg.port);
+      break;
+    } catch (e) {
+      console.error('[backend] restart failed', e.message);
+      if (attempt === 5 && win) win.webContents.send('backend-down');
+    }
+  }
+  restarting = false;
+}
+
+async function backendAlive() {
+  if (!cfg.port) return false;
+  try {
+    const r = await fetch(`http://127.0.0.1:${cfg.port}/api/health`, { headers: { 'X-Sentinel-Token': cfg.token }, signal: AbortSignal.timeout(4000) });
+    return r.ok;
+  } catch (_) { return false; }
+}
+
+// ------------------------------------------------------------------ start at login (always-on)
+// macOS: a per-user LaunchAgent starts Sentinel hidden at every login and relaunches it if it crashes
+// (KeepAlive/SuccessfulExit=false). Choosing "Quit" exits cleanly, so launchd leaves it stopped until next login.
+// Windows: the standard login item. Linux: ~/.config/autostart desktop entry.
+const AGENT_LABEL = 'com.fighter.sentinel';
+const agentPlist = () => path.join(os.homedir(), 'Library', 'LaunchAgents', `${AGENT_LABEL}.plist`);
+function launchArgs() {
+  return app.isPackaged ? [process.execPath, '--hidden'] : [process.execPath, app.getAppPath(), '--hidden'];
+}
+const autoStart = {
+  get() {
+    if (isMac) return fs.existsSync(agentPlist());
+    if (isWin) return app.getLoginItemSettings().openAtLogin;
+    return fs.existsSync(path.join(os.homedir(), '.config', 'autostart', 'sentinel.desktop'));
+  },
+  set(on) {
+    if (isMac) {
+      const uid = process.getuid();
+      try { execFileSync('/bin/launchctl', ['bootout', `gui/${uid}/${AGENT_LABEL}`], { stdio: 'ignore' }); } catch (_) {}
+      if (!on) { fs.rmSync(agentPlist(), { force: true }); return; }
+      const xml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${AGENT_LABEL}</string>
+  <key>ProgramArguments</key><array>${launchArgs().map(a => `<string>${xml(a)}</string>`).join('')}</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardErrorPath</key><string>${xml(path.join(dataDir(), 'sentinel-agent.log'))}</string>
+</dict></plist>
+`;
+      fs.mkdirSync(path.dirname(agentPlist()), { recursive: true });
+      fs.writeFileSync(agentPlist(), plist);
+      // register now; the copy launchd starts sees we're already running (single-instance lock) and exits cleanly
+      try { execFileSync('/bin/launchctl', ['bootstrap', `gui/${uid}`, agentPlist()], { stdio: 'ignore' }); } catch (_) {}
+      return;
+    }
+    if (isWin) { app.setLoginItemSettings({ openAtLogin: on, args: ['--hidden'] }); return; }
+    const f = path.join(os.homedir(), '.config', 'autostart', 'sentinel.desktop');
+    if (!on) { fs.rmSync(f, { force: true }); return; }
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, `[Desktop Entry]\nType=Application\nName=Sentinel\nExec=${launchArgs().map(a => `"${a}"`).join(' ')}\nX-GNOME-Autostart-enabled=true\n`);
+  },
+};
+
+// Turn always-on monitoring on the first time the installed app runs (the user can switch it off in the tray).
+function firstRunAutoStart() {
+  const flag = path.join(dataDir(), 'ui.json');
+  let st = {};
+  try { st = JSON.parse(fs.readFileSync(flag, 'utf8')); } catch (_) {}
+  if (!st.autostartConfigured && app.isPackaged) {
+    try { autoStart.set(true); } catch (e) { console.error('autostart', e); }
+    st.autostartConfigured = true;
+    fs.writeFileSync(flag, JSON.stringify(st));
+  } else if (st.autostartConfigured && isMac && autoStart.get()) {
+    // app was moved/updated: keep the LaunchAgent pointing at the current binary
+    try { if (!fs.readFileSync(agentPlist(), 'utf8').includes(process.execPath)) autoStart.set(true); } catch (_) {}
+  }
+}
+
+// ------------------------------------------------------------------ sleep / wake
+function watchPower() {
+  // stop macOS App Nap from throttling the hidden app and its engine (does NOT keep the Mac awake)
+  powerSaveBlocker.start('prevent-app-suspension');
+  const recheck = async why => {
+    if (quitting) return;
+    await new Promise(r => setTimeout(r, 3000));          // let the network come back first
+    if (await backendAlive()) {
+      fetch(`http://127.0.0.1:${cfg.port}/api/egress/resume`, { method: 'POST', headers: { 'X-Sentinel-Token': cfg.token } }).catch(() => {});
+      if (win) win.webContents.send('resumed', why);
+    } else if (!cfg.elevated) {
+      restartBackend(`not responding after ${why}`);
+    } else if (win) {
+      win.webContents.send('backend-down');
+    }
+  };
+  powerMonitor.on('resume', () => recheck('wake from sleep'));
+  powerMonitor.on('unlock-screen', () => recheck('screen unlock'));
+  // belt and braces: a light health check every minute catches anything the events miss
+  setInterval(async () => { if (!quitting && !restarting && !cfg.elevated && !(await backendAlive())) restartBackend('health check failed'); }, 60000);
 }
 
 // macOS privacy protection (TCC) stops root processes started from a password prompt reading
@@ -159,10 +303,13 @@ function createWindow() {
     width: 1480, height: 940, minWidth: 1100, minHeight: 700,
     backgroundColor: '#0d0f12',
     title: 'Sentinel',
+    // launched at login -> stay in the tray; the renderer still runs and raises alerts
+    show: !process.argv.includes('--hidden'),
     titleBarStyle: isMac ? 'hiddenInset' : 'default',
     autoHideMenuBar: true,
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
     webPreferences: {
+      backgroundThrottling: false,   // keep alert polling + notifications running while hidden in the tray
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true, nodeIntegration: false, sandbox: true,
     },
@@ -182,9 +329,14 @@ function createTray() {
       ? nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'trayTemplate.png'))   // auto-tinted menu-bar template
       : nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png')).resize({ width: 16, height: 16 });
     tray = new Tray(img);
-    tray.setToolTip('Sentinel - monitoring connections');
+    tray.setToolTip('Sentinel - monitoring connections and data leaving this computer');
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: 'Open Sentinel', click: () => { win.show(); win.focus(); } },
+      { label: 'Data leaving this computer', click: () => { win.show(); win.focus(); win.webContents.send('navigate', 'egress'); } },
+      { type: 'separator' },
+      // Always-on: start hidden in the tray at login (and relaunch after a crash) so monitoring never stops.
+      { label: 'Start automatically at login', type: 'checkbox', checked: autoStart.get(),
+        click: item => { try { autoStart.set(item.checked); } catch (e) { dialog.showErrorBox('Sentinel', String(e.message || e)); } } },
       { type: 'separator' },
       { label: 'Quit (stop monitoring)', click: () => { quitting = true; app.quit(); } },
     ]));
@@ -193,14 +345,15 @@ function createTray() {
 }
 
 ipcMain.handle('config', () => ({ port: cfg.port, token: cfg.token, platform: process.platform, elevated: cfg.elevated, version: app.getVersion() }));
-ipcMain.handle('notify', (_e, { title, body }) => {
+ipcMain.handle('notify', (_e, { title, body, view }) => {
   if (Notification.isSupported()) {
     const n = new Notification({ title, body, silent: false });
-    n.on('click', () => { win.show(); win.focus(); win.webContents.send('navigate', 'network'); });
+    n.on('click', () => { win.show(); win.focus(); win.webContents.send('navigate', view === 'egress' ? 'egress' : 'network'); });
     n.show();
   }
 });
 ipcMain.handle('elevate', () => elevateBackend());
+ipcMain.handle('autostart', (_e, on) => { if (typeof on === 'boolean') autoStart.set(on); return autoStart.get(); });
 ipcMain.handle('open-file', async (_e, filters) => {
   const r = await dialog.showOpenDialog(win, { properties: ['openFile'], filters: filters || [{ name: 'Text/JSON', extensions: ['txt', 'json', 'csv', 'list', 'hosts'] }] });
   if (r.canceled || !r.filePaths[0]) return null;
@@ -229,12 +382,15 @@ app.whenReady().then(async () => {
   try {
     await startBackend();
   } catch (e) {
+    if (process.argv.includes('--hidden')) { console.error(e); app.exit(1); return; }  // at login: let launchd retry
     dialog.showErrorBox('Sentinel', String(e.message || e));
     app.quit();
     return;
   }
+  firstRunAutoStart();
   createWindow();
   createTray();
+  watchPower();
   app.on('activate', () => { if (win) win.show(); });
 });
 

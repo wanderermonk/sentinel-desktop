@@ -24,6 +24,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 from sentinel import advisor, inventory, network, platform_utils, ports, remediation, store, vulns  # noqa: E402
+from sentinel.egress import EgressMonitor  # noqa: E402
 
 STATE: dict = {"ports": [], "connections": [], "findings": [], "apps": [], "scanned_at": {}}
 ALERTS: list[dict] = []
@@ -31,6 +32,7 @@ JOBS: dict[str, dict] = {}
 _alerted: set[str] = set()
 LOCK = threading.Lock()
 TOKEN = ""
+EGRESS: EgressMonitor | None = None
 
 
 def do_ports():
@@ -116,6 +118,21 @@ def monitor_loop():
         time.sleep(15)
 
 
+def egress_loop():
+    """Always-on upload accounting. Separate from monitor_loop so a slow DNS scan never delays it."""
+    global EGRESS
+    EGRESS = EgressMonitor()
+    while True:
+        try:
+            for a in EGRESS.tick():
+                with LOCK:
+                    ALERTS.append(a)
+                    del ALERTS[:-200]
+        except Exception:
+            traceback.print_exc()
+        time.sleep(max(2, EGRESS.interval))
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "Sentinel/1.0"
 
@@ -186,6 +203,13 @@ class H(BaseHTTPRequestHandler):
             if p == "/api/alerts":
                 since = float(q.get("since", 0))
                 return self._send(200, {"alerts": [a for a in ALERTS if a["ts"] > since]})
+            if p == "/api/egress":
+                if EGRESS is None:
+                    return self._send(200, {"collector": {"available": False, "note": "Egress Watch is starting…"}, "apps": [], "timeline": []})
+                snap = EGRESS.snapshot()
+                with LOCK:
+                    snap["alerts"] = [a for a in ALERTS if a.get("kind") == "egress"][-50:][::-1]
+                return self._send(200, snap)
             if p == "/api/job":
                 j = JOBS.get(q.get("id", ""))
                 return self._send(200, j or {"state": "unknown"})
@@ -259,6 +283,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, r)
             if p == "/api/pf/reapply":
                 return self._send(200, remediation.reapply_pf_rules())
+            if p == "/api/egress/resume":
+                if EGRESS is not None:
+                    EGRESS.resumed = True
+                return self._send(200, {"ok": True})
             if p == "/api/policy":
                 return self._send(200, store.save_policy(b))
             if p == "/api/policy/allow":
@@ -309,6 +337,7 @@ def main():
         threading.Thread(target=watchdog, daemon=True).start()
     if not a.no_monitor:
         threading.Thread(target=monitor_loop, daemon=True).start()
+        threading.Thread(target=egress_loop, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
