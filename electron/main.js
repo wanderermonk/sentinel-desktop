@@ -28,6 +28,17 @@ function dataDir() {
   return d;
 }
 
+// DeskMonitor link: publish the engine's port + token in an owner-only file so the
+// desktop widget can read /api/summary. Removed again when Sentinel quits.
+function publishEngine() {
+  const f = path.join(dataDir(), 'engine.json');
+  try {
+    if (!cfg.port || quitting) { fs.rmSync(f, { force: true }); return; }
+    fs.writeFileSync(f, JSON.stringify({ port: cfg.port, token: cfg.token, pid: process.pid, elevated: cfg.elevated }), { mode: 0o600 });
+    if (!isWin) fs.chmodSync(f, 0o600);
+  } catch (_) {}
+}
+
 // Absolute path to an executable: elevated shells run from '/' with root's PATH,
 // so relative paths (.venv/bin/python) and bare names (python3) would resolve differently.
 function absoluteExe(cmd) {
@@ -116,6 +127,7 @@ async function startBackend() {
   }
   cfg.port = port;
   cfg.elevated = false;
+  publishEngine();
 }
 
 // Bring the engine back after a crash or a failed wake-up, then point the UI at the new port.
@@ -283,6 +295,7 @@ async function elevateBackend() {
         return resolve({ ok: false, error: `Admin engine did not start. ${tail || 'See ' + log}` });
       }
       const old = backend; cfg.elevated = true; cfg.port = port; backend = null;
+      publishEngine();
       try { old && old.kill(); } catch (_) {}
       resolve({ ok: true, port });
     });
@@ -291,6 +304,7 @@ async function elevateBackend() {
 
 function stopBackend() {
   quitting = true;
+  publishEngine();   // quitting -> removes engine.json
   try { backend && backend.kill(); } catch (_) {}
   if (cfg.elevated && cfg.port) {
     // the elevated engine runs as root and cannot be killed by us: ask it to exit (it also watches our PID)
