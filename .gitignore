@@ -12,3 +12,5 @@ dist/mac-arm64/Sentinel.app/Contents/Frameworks/Electron Framework.framework/Ele
 dist/mac-arm64/Sentinel.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework
 node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Framework.framework/Electron Framework
 node_modules/electron/dist/Electron.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework
+# macOS metadata on external drives
+._*
